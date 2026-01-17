@@ -382,15 +382,23 @@ async function ingestNew() {
   const state = await getState(communityId);
   const stopId = state.last_seen_tweet_id || null;
 
+  // Получаем все твиты за последние 24 часа
+  const hoursToFetch = 24;
+  const cutoffTime = new Date(Date.now() - hoursToFetch * 3600 * 1000);
+
   let cursor = null;
   let newLastSeen = null;
   let inserted = 0;
   let stopped = false;
+  let page = 0;
 
-  for (let page = 1; page <= TOP_PAGES; page++) {
+  while (true) {
+    page++;
     const data = await api.getCommunityTweets({ community_id: communityId, cursor });
     const tweets = Array.isArray(data?.tweets) ? data.tweets : [];
     if (page === 1 && tweets[0]?.id) newLastSeen = String(tweets[0].id);
+
+    let foundOldTweet = false;
 
     for (const t of tweets) {
       const id = String(t.id);
@@ -398,16 +406,33 @@ async function ingestNew() {
         stopped = true;
         break;
       }
+      
       const tw = normalizeTweet(t);
+      
+      // Проверяем, не старше ли твит 24 часов
+      if (tw.created_at) {
+        const tweetTime = new Date(tw.created_at);
+        if (tweetTime < cutoffTime) {
+          foundOldTweet = true;
+          break;
+        }
+      }
+      
       await upsertCommunityTweet(communityId, tw);
       inserted++;
     }
 
-    console.log(`ingest-new page=${page} inserted=${inserted} stopped=${stopped}`);
+    console.log(`ingest-new page=${page} inserted=${inserted} stopped=${stopped} foundOldTweet=${foundOldTweet}`);
 
-    if (stopped) break;
+    if (stopped || foundOldTweet) break;
     if (!data?.has_next_page || !data?.next_cursor) break;
     cursor = data.next_cursor;
+    
+    // Защита от бесконечного цикла - максимум 100 страниц
+    if (page >= 100) {
+      console.log("ingest-new: reached max pages limit (100)");
+      break;
+    }
   }
 
   if (newLastSeen) {
@@ -415,7 +440,7 @@ async function ingestNew() {
   }
 }
 
-async function refreshMetrics({ hours = RECENT_HOURS, all = false } = {}) {
+async function refreshMetrics({ hours = RECENT_HOURS, all = false, force = false } = {}) {
   const communityId = COMMUNITY_ID;
   if (!communityId) die("No COMMUNITY_ID");
 
@@ -425,13 +450,19 @@ async function refreshMetrics({ hours = RECENT_HOURS, all = false } = {}) {
 
   const params = all ? [communityId] : [communityId, String(hours)];
 
+  // Если force=true или hours <= 24, обновляем все твиты без ограничения на 6 часов
+  // Это гарантирует, что все твиты за последние 24 часа получат свежие метрики
+  const updateCondition = force || hours <= 24
+    ? `1=1`  // Обновляем все твиты в указанном диапазоне
+    : `(tm.tweet_id IS NULL OR tm.updated_at < now() - interval '6 hours')`;
+
   const r = await q(
     `
     SELECT ct.tweet_id
     FROM community_tweets ct
     LEFT JOIN tweet_metrics_latest tm ON tm.tweet_id = ct.tweet_id
     WHERE ${where}
-      AND (tm.tweet_id IS NULL OR tm.updated_at < now() - interval '6 hours')
+      AND ${updateCondition}
     ORDER BY ct.created_at DESC NULLS LAST
     LIMIT 5000
   `,
@@ -439,7 +470,7 @@ async function refreshMetrics({ hours = RECENT_HOURS, all = false } = {}) {
   );
 
   const ids = r.rows.map((x) => String(x.tweet_id));
-  console.log(`refresh-metrics: tweets to update = ${ids.length} (all=${all}, hours=${hours})`);
+  console.log(`refresh-metrics: tweets to update = ${ids.length} (all=${all}, hours=${hours}, force=${force})`);
   if (ids.length === 0) return;
 
   for (const group of chunk(ids, BATCH_TWEET_IDS)) {
@@ -554,6 +585,23 @@ async function userStats(username) {
   console.log(r.rows[0] || { username: username.toLowerCase(), posts: 0, views: 0, likes: 0 });
 }
 
+async function syncLast24Hours() {
+  const communityId = COMMUNITY_ID;
+  if (!communityId) die("No COMMUNITY_ID");
+
+  console.log("=== Синхронизация твитов и метрик за последние 24 часа ===");
+  
+  // Сначала получаем все новые твиты за последние 24 часа
+  console.log("Шаг 1: Получение всех твитов за последние 24 часа...");
+  await ingestNew();
+  
+  // Затем обновляем метрики для всех твитов за последние 24 часа
+  console.log("Шаг 2: Обновление метрик для всех твитов за последние 24 часа...");
+  await refreshMetrics({ hours: 24, force: true });
+  
+  console.log("=== Синхронизация завершена ===");
+}
+
 async function main() {
   const cmd = process.argv[2];
 
@@ -564,10 +612,11 @@ Commands:
   node parser.js doctor
   node parser.js backfill
   node parser.js ingest-new
-  node parser.js refresh-metrics [--all] [--hours=48]
+  node parser.js refresh-metrics [--all] [--hours=48] [--force]
   node parser.js refresh-users [--hours=24]
   node parser.js sync-members
   node parser.js user-stats <username>
+  node parser.js sync-24h (получить все твиты и метрики за последние 24 часа)
 
 Env:
   TWITTERAPI_IO_KEY
@@ -576,7 +625,7 @@ Env:
   PGSSL=true (Railway обычно)
   MIN_REQUEST_INTERVAL_MS=5200
   TOP_PAGES=3
-  RECENT_HOURS=48
+  RECENT_HOURS=48 (по умолчанию для refresh-metrics, но для последних 24ч используется force)
   ACTIVE_HOURS=24
   BATCH_TWEET_IDS=80
   BACKFILL_CUTOFF_DAYS=0
@@ -592,17 +641,19 @@ Env:
     if (cmd === "doctor") await doctor();
     else if (cmd === "backfill") await backfill();
     else if (cmd === "ingest-new") await ingestNew();
-    else if (cmd === "refresh-metrics") {
+    else     if (cmd === "refresh-metrics") {
       const all = process.argv.includes("--all");
+      const force = process.argv.includes("--force");
       const hoursArg = process.argv.find((x) => x.startsWith("--hours="));
       const hours = hoursArg ? Number(hoursArg.split("=")[1]) : RECENT_HOURS;
-      await refreshMetrics({ all, hours });
+      await refreshMetrics({ all, hours, force });
     } else if (cmd === "refresh-users") {
       const hoursArg = process.argv.find((x) => x.startsWith("--hours="));
       const hours = hoursArg ? Number(hoursArg.split("=")[1]) : ACTIVE_HOURS;
       await refreshUsers({ hours });
-    } else if (cmd === "sync-members") await syncMembers();
+    } else     if (cmd === "sync-members") await syncMembers();
     else if (cmd === "user-stats") await userStats(process.argv[3]);
+    else if (cmd === "sync-24h" || cmd === "sync-last-24h") await syncLast24Hours();
     else die(`Unknown command: ${cmd}`);
   } finally {
     // pool закрываем ТОЛЬКО здесь (иначе "Cannot use a pool after calling end")
