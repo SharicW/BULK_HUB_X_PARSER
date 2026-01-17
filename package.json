@@ -8,11 +8,12 @@
           "doctor": "node parser.js doctor",
           "backfill": "node parser.js backfill",
           "ingest": "node parser.js ingest-new",
-          "refresh:metrics": "node parser.js refresh-metrics",
-          "refresh:users": "node parser.js refresh-users",
-          "sync:members": "node parser.js sync-members",
-          "user:stats": "node parser.js user-stats",
-          "daily": "npm run ingest && npm run refresh:metrics && npm run refresh:users"
+        "refresh:metrics": "node parser.js refresh-metrics",
+        "refresh:users": "node parser.js refresh-users",
+        "sync:members": "node parser.js sync-members",
+        "user:stats": "node parser.js user-stats",
+        "sync:24h": "node parser.js sync-24h",
+        "daily": "npm run ingest && npm run refresh:metrics && npm run refresh:users"
         },
     "dependencies": {
         "dotenv": "^16.4.5",
