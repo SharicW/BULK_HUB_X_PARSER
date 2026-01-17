@@ -1,0 +1,23 @@
+{
+    "name": "x-community-parser",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+          "db:schema": "psql \"%DATABASE_URL%\" -f schema.sql",
+          "migrate": "node migrate.js",
+          "doctor": "node parser.js doctor",
+          "backfill": "node parser.js backfill",
+          "ingest": "node parser.js ingest-new",
+          "refresh:metrics": "node parser.js refresh-metrics",
+          "refresh:users": "node parser.js refresh-users",
+          "sync:members": "node parser.js sync-members",
+          "user:stats": "node parser.js user-stats",
+          "daily": "npm run ingest && npm run refresh:metrics && npm run refresh:users"
+        },
+    "dependencies": {
+        "dotenv": "^16.4.5",
+        "express": "^5.2.1",
+        "p-limit": "^6.1.0",
+        "pg": "^8.12.0"
+    }
+}

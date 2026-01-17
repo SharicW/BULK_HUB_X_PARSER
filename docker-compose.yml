@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:16
+    container_name: xparser-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: xparser
+    ports:
+      - "5432:5432"
+    volumes:
+      - xparser_data:/var/lib/postgresql/data
+
+volumes:
+  xparser_data:
+
