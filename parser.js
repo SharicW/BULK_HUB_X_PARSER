@@ -749,10 +749,11 @@ Env:
       const hours = hoursArg ? Number(hoursArg.split("=")[1]) : RECENT_HOURS;
       await refreshMetrics({ all, hours, force });
     } else if (cmd === "refresh-users") {
-      const hoursArg = process.argv.find((x) => x.startsWith("--hours="));
-      const hours = hoursArg ? Number(hoursArg.split("=")[1]) : ACTIVE_HOURS;
-      await refreshUsers({ hours });
-    } else     if (cmd === "sync-members") await syncMembers();
+  const all = process.argv.includes("--all");
+  const hoursArg = process.argv.find((x) => x.startsWith("--hours="));
+  const hours = hoursArg ? Number(hoursArg.split("=")[1]) : ACTIVE_HOURS;
+  await refreshUsers({ hours, all });
+} else     if (cmd === "sync-members") await syncMembers();
     else if (cmd === "user-stats") await userStats(process.argv[3]);
     else if (cmd === "sync-24h" || cmd === "sync-last-24h") await syncLast24Hours();
     else die(`Unknown command: ${cmd}`);
@@ -768,5 +769,6 @@ process.on("unhandledRejection", (e) => {
 });
 
 main();
+
 
 
