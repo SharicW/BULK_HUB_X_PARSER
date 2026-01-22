@@ -575,31 +575,44 @@ async function refreshMetrics({ hours = RECENT_HOURS, all = false, force = false
   console.log("refresh-metrics done.");
 }
 
-async function refreshUsers({ hours = ACTIVE_HOURS } = {}) {
+async function refreshUsers({ hours = ACTIVE_HOURS, all = false } = {}) {
   const communityId = COMMUNITY_ID;
   if (!communityId) die("No COMMUNITY_ID");
 
+  // ВАЖНО: all=true -> без фильтра по created_at
+  // Плюс оптимизация: обновляем только тех, кого давно не обновляли (например, 7 дней)
   const r = await q(
-    `
-    SELECT DISTINCT lower(author_username) as username
-    FROM community_tweets
-    WHERE community_id=$1
-      AND author_username IS NOT NULL
-      AND created_at >= now() - ($2 || ' hours')::interval
-    ORDER BY 1
-  `,
-    [communityId, String(hours)]
+    all
+      ? `
+        SELECT DISTINCT lower(ct.author_username) AS username
+        FROM community_tweets ct
+        LEFT JOIN users u ON lower(u.username) = lower(ct.author_username)
+        WHERE ct.community_id=$1
+          AND ct.author_username IS NOT NULL
+          AND (u.updated_at IS NULL OR u.updated_at < now() - interval '7 days')
+        ORDER BY 1
+      `
+      : `
+        SELECT DISTINCT lower(ct.author_username) AS username
+        FROM community_tweets ct
+        LEFT JOIN users u ON lower(u.username) = lower(ct.author_username)
+        WHERE ct.community_id=$1
+          AND ct.author_username IS NOT NULL
+          AND ct.created_at >= now() - ($2 || ' hours')::interval
+          AND (u.updated_at IS NULL OR u.updated_at < now() - interval '12 hours')
+        ORDER BY 1
+      `,
+    all ? [communityId] : [communityId, String(hours)]
   );
 
   const users = r.rows.map((x) => x.username).filter(Boolean);
-  console.log(`refresh-users: found ${users.length} active users (last ${hours}h)`);
+  console.log(`refresh-users: updating ${users.length} users (all=${all}, hours=${hours})`);
 
   for (const username of users) {
     try {
       const data = await api.getUserInfo(username);
-      if (data?.user) await upsertUser(data.user);
-      else if (data?.data) await upsertUser(data.data);
-      else if (data?.result) await upsertUser(data.result);
+      const u = data?.user || data?.data || data?.result;
+      if (u) await upsertUser(u);
       console.log(`refresh-users ok @${username}`);
     } catch (e) {
       console.warn(`refresh-users fail @${username}: ${e.message}`);
@@ -755,4 +768,5 @@ process.on("unhandledRejection", (e) => {
 });
 
 main();
+
 
