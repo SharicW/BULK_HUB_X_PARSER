@@ -15,7 +15,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // free-tier часто 1 запрос / 5 секунд -> ставим 5200-6000мс
 const MIN_REQUEST_INTERVAL_MS = Number(process.env.MIN_REQUEST_INTERVAL_MS || 5200);
 
-// сколько страниц newest-листы смотреть (ingest-new) — сейчас не используется, но оставил как env
+// сколько страниц newest-листы смотреть (ingest-new)
 const TOP_PAGES = Number(process.env.TOP_PAGES || 3);
 
 // сколько часов считать “recent tweets” для обновления метрик
@@ -94,6 +94,7 @@ class TwitterApiIO {
         let waitMs = this.minIntervalMs + attempt * 1000; // растём
         try {
           const j = await res.json();
+          // иногда там msg типа "one request every 5 seconds"
           console.warn("API 429:", j?.message || j?.msg || "Too Many Requests");
         } catch {}
         console.warn(`429 -> retry in ${waitMs}ms (attempt ${attempt}/${retries})`);
@@ -202,6 +203,32 @@ function parseCreatedAt(s) {
   return d.toISOString(); // pg нормально примет ISO
 }
 
+function normalizeTweet(t) {
+  const tweet_id = String(t.id);
+  const url = t.url || null;
+  const text = t.text || "";
+  const created_at = parseCreatedAt(t.createdAt);
+
+  const author_user_id = t?.author?.id ? String(t.author.id) : null;
+  const author_username = t?.author?.userName || t?.author?.username || null;
+  const author_name = t?.author?.name || null;
+
+  const media_urls = extractMediaUrls(t);     // ✅ картинки
+  const raw_json = t;                         // ✅ сохраняем raw (удобно на будущее)
+
+  return {
+    tweet_id,
+    url,
+    text,
+    created_at,
+    author_user_id,
+    author_username,
+    author_name,
+    media_urls,
+    raw_json,
+  };
+}
+
 function extractMediaUrls(tweetObj) {
   const urls = new Set();
 
@@ -250,31 +277,7 @@ function extractMediaUrls(tweetObj) {
   return Array.from(urls);
 }
 
-function normalizeTweet(t) {
-  const tweet_id = String(t.id);
-  const url = t.url || null;
-  const text = t.text || "";
-  const created_at = parseCreatedAt(t.createdAt);
 
-  const author_user_id = t?.author?.id ? String(t.author.id) : null;
-  const author_username = t?.author?.userName || t?.author?.username || null;
-  const author_name = t?.author?.name || null;
-
-  const media_urls = extractMediaUrls(t); // ✅ картинки
-  const raw_json = t; // ✅ сохраняем raw (удобно на будущее)
-
-  return {
-    tweet_id,
-    url,
-    text,
-    created_at,
-    author_user_id,
-    author_username,
-    author_name,
-    media_urls,
-    raw_json,
-  };
-}
 
 async function upsertCommunityTweet(communityId, tw) {
   try {
@@ -460,16 +463,16 @@ async function backfill() {
   }
 }
 
-// ✅ теперь ingestNew принимает {hours}
-async function ingestNew({ hours = 24 } = {}) {
+async function ingestNew() {
   const communityId = COMMUNITY_ID;
   if (!communityId) die("No COMMUNITY_ID");
 
   const state = await getState(communityId);
   const stopId = state.last_seen_tweet_id || null;
 
-  // Получаем все твиты за последние N часов
-  const cutoffTime = new Date(Date.now() - Number(hours) * 3600 * 1000);
+  // Получаем все твиты за последние 24 часа
+  const hoursToFetch = 24;
+  const cutoffTime = new Date(Date.now() - hoursToFetch * 3600 * 1000);
 
   let cursor = null;
   let newLastSeen = null;
@@ -491,10 +494,10 @@ async function ingestNew({ hours = 24 } = {}) {
         stopped = true;
         break;
       }
-
+      
       const tw = normalizeTweet(t);
-
-      // Проверяем, не старше ли твит N часов
+      
+      // Проверяем, не старше ли твит 24 часов
       if (tw.created_at) {
         const tweetTime = new Date(tw.created_at);
         if (tweetTime < cutoffTime) {
@@ -502,17 +505,17 @@ async function ingestNew({ hours = 24 } = {}) {
           break;
         }
       }
-
+      
       await upsertCommunityTweet(communityId, tw);
       inserted++;
     }
 
-    console.log(`ingest-new hours=${hours} page=${page} inserted=${inserted} stopped=${stopped} foundOldTweet=${foundOldTweet}`);
+    console.log(`ingest-new page=${page} inserted=${inserted} stopped=${stopped} foundOldTweet=${foundOldTweet}`);
 
     if (stopped || foundOldTweet) break;
     if (!data?.has_next_page || !data?.next_cursor) break;
     cursor = data.next_cursor;
-
+    
     // Защита от бесконечного цикла - максимум 100 страниц
     if (page >= 100) {
       console.log("ingest-new: reached max pages limit (100)");
@@ -536,10 +539,10 @@ async function refreshMetrics({ hours = RECENT_HOURS, all = false, force = false
   const params = all ? [communityId] : [communityId, String(hours)];
 
   // Если force=true или hours <= 24, обновляем все твиты без ограничения на 6 часов
-  const updateCondition =
-    force || hours <= 24
-      ? `1=1`
-      : `(tm.tweet_id IS NULL OR tm.updated_at < now() - interval '6 hours')`;
+  // Это гарантирует, что все твиты за последние 24 часа получат свежие метрики
+  const updateCondition = force || hours <= 24
+    ? `1=1`  // Обновляем все твиты в указанном диапазоне
+    : `(tm.tweet_id IS NULL OR tm.updated_at < now() - interval '6 hours')`;
 
   const r = await q(
     `
@@ -646,6 +649,7 @@ async function userStats(username) {
   if (!communityId) die("No COMMUNITY_ID");
   if (!username) die("Usage: node parser.js user-stats <username>");
 
+  // all-time totals for user
   const r = await q(
     `
     SELECT
@@ -669,35 +673,21 @@ async function userStats(username) {
   console.log(r.rows[0] || { username: username.toLowerCase(), posts: 0, views: 0, likes: 0 });
 }
 
-// ✅ ОДНА “общая” команда: tweets + metrics + users (+ optional members)
-async function syncCommunity({ hours = 24, members = false } = {}) {
+async function syncLast24Hours() {
   const communityId = COMMUNITY_ID;
   if (!communityId) die("No COMMUNITY_ID");
 
-  console.log(`=== Sync: tweets + metrics + users (last ${hours}h) ===`);
-
-  console.log("Step 1: ingest tweets...");
-  await ingestNew({ hours });
-
-  console.log("Step 2: refresh metrics...");
-  await refreshMetrics({ hours, force: true });
-
-  console.log("Step 3: refresh active users...");
-  await refreshUsers({ hours });
-
-  if (members) {
-    console.log("Step 4: sync members...");
-    await syncMembers();
-  }
-
-  console.log("=== Sync done ===");
-}
-
-function getArgValue(prefix) {
-  const x = process.argv.find((a) => a.startsWith(prefix));
-  if (!x) return null;
-  const v = x.slice(prefix.length);
-  return v === "" ? null : v;
+  console.log("=== Синхронизация твитов и метрик за последние 24 часа ===");
+  
+  // Сначала получаем все новые твиты за последние 24 часа
+  console.log("Шаг 1: Получение всех твитов за последние 24 часа...");
+  await ingestNew();
+  
+  // Затем обновляем метрики для всех твитов за последние 24 часа
+  console.log("Шаг 2: Обновление метрик для всех твитов за последние 24 часа...");
+  await refreshMetrics({ hours: 24, force: true });
+  
+  console.log("=== Синхронизация завершена ===");
 }
 
 async function main() {
@@ -705,18 +695,16 @@ async function main() {
 
   try {
     if (!cmd || cmd === "help" || cmd === "--help") {
-      console.log(
-        `
+      console.log(`
 Commands:
   node parser.js doctor
   node parser.js backfill
-  node parser.js ingest-new [--hours=24]
+  node parser.js ingest-new
   node parser.js refresh-metrics [--all] [--hours=48] [--force]
   node parser.js refresh-users [--hours=24]
   node parser.js sync-members
   node parser.js user-stats <username>
-  node parser.js sync [--hours=24] [--members]   (твиты + метрики + активные пользователи; опционально участники)
-  node parser.js sync-24h                        (алиас: sync --hours=24)
+  node parser.js sync-24h (получить все твиты и метрики за последние 24 часа)
 
 Env:
   TWITTERAPI_IO_KEY
@@ -725,13 +713,12 @@ Env:
   PGSSL=true (Railway обычно)
   MIN_REQUEST_INTERVAL_MS=5200
   TOP_PAGES=3
-  RECENT_HOURS=48
+  RECENT_HOURS=48 (по умолчанию для refresh-metrics, но для последних 24ч используется force)
   ACTIVE_HOURS=24
   BATCH_TWEET_IDS=80
   BACKFILL_CUTOFF_DAYS=0
   BACKFILL_PAGES_PER_RUN=50
-      `.trim()
-      );
+      `.trim());
       return;
     }
 
@@ -739,34 +726,23 @@ Env:
     if (!COMMUNITY_ID) die("Missing COMMUNITY_ID");
     if (!API_KEY) die("Missing TWITTERAPI_IO_KEY");
 
-    if (cmd === "doctor") {
-      await doctor();
-    } else if (cmd === "backfill") {
-      await backfill();
-    } else if (cmd === "ingest-new") {
-      const hours = Number(getArgValue("--hours=") || 24);
-      await ingestNew({ hours });
-    } else if (cmd === "refresh-metrics") {
+    if (cmd === "doctor") await doctor();
+    else if (cmd === "backfill") await backfill();
+    else if (cmd === "ingest-new") await ingestNew();
+    else     if (cmd === "refresh-metrics") {
       const all = process.argv.includes("--all");
       const force = process.argv.includes("--force");
-      const hours = Number(getArgValue("--hours=") || RECENT_HOURS);
+      const hoursArg = process.argv.find((x) => x.startsWith("--hours="));
+      const hours = hoursArg ? Number(hoursArg.split("=")[1]) : RECENT_HOURS;
       await refreshMetrics({ all, hours, force });
     } else if (cmd === "refresh-users") {
-      const hours = Number(getArgValue("--hours=") || ACTIVE_HOURS);
+      const hoursArg = process.argv.find((x) => x.startsWith("--hours="));
+      const hours = hoursArg ? Number(hoursArg.split("=")[1]) : ACTIVE_HOURS;
       await refreshUsers({ hours });
-    } else if (cmd === "sync-members") {
-      await syncMembers();
-    } else if (cmd === "user-stats") {
-      await userStats(process.argv[3]);
-    } else if (cmd === "sync") {
-      const hours = Number(getArgValue("--hours=") || 24);
-      const members = process.argv.includes("--members");
-      await syncCommunity({ hours, members });
-    } else if (cmd === "sync-24h" || cmd === "sync-last-24h") {
-      await syncCommunity({ hours: 24, members: false });
-    } else {
-      die(`Unknown command: ${cmd}`);
-    }
+    } else     if (cmd === "sync-members") await syncMembers();
+    else if (cmd === "user-stats") await userStats(process.argv[3]);
+    else if (cmd === "sync-24h" || cmd === "sync-last-24h") await syncLast24Hours();
+    else die(`Unknown command: ${cmd}`);
   } finally {
     // pool закрываем ТОЛЬКО здесь (иначе "Cannot use a pool after calling end")
     await pool.end();
@@ -779,3 +755,4 @@ process.on("unhandledRejection", (e) => {
 });
 
 main();
+
