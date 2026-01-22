@@ -208,8 +208,13 @@ function normalizeTweet(t) {
   const url = t.url || null;
   const text = t.text || "";
   const created_at = parseCreatedAt(t.createdAt);
+
   const author_user_id = t?.author?.id ? String(t.author.id) : null;
   const author_username = t?.author?.userName || t?.author?.username || null;
+  const author_name = t?.author?.name || null;
+
+  const media_urls = extractMediaUrls(t);     // ✅ картинки
+  const raw_json = t;                         // ✅ сохраняем raw (удобно на будущее)
 
   return {
     tweet_id,
@@ -218,33 +223,116 @@ function normalizeTweet(t) {
     created_at,
     author_user_id,
     author_username,
+    author_name,
+    media_urls,
+    raw_json,
   };
 }
 
+function extractMediaUrls(tweetObj) {
+  const urls = new Set();
+
+  const add = (u) => {
+    if (!u) return;
+    const s = String(u).trim();
+    if (!s.startsWith("http")) return;
+
+    // картинки обычно pbs.twimg.com/media...
+    if (s.includes("pbs.twimg.com/media") || /\.(jpg|jpeg|png|webp)(\?|$)/i.test(s)) {
+      urls.add(s);
+    }
+  };
+
+  const walk = (x) => {
+    if (!x) return;
+
+    if (Array.isArray(x)) {
+      for (const i of x) walk(i);
+      return;
+    }
+
+    if (typeof x === "object") {
+      // частые поля
+      add(x.media_url_https);
+      add(x.media_url);
+      add(x.preview_image_url);
+      add(x.url);
+
+      // twitterapi.io / twitter v2 includes
+      if (x.media) walk(x.media);
+      if (x.includes && x.includes.media) walk(x.includes.media);
+
+      // legacy structures (иногда встречаются)
+      if (x.legacy?.extended_entities?.media) walk(x.legacy.extended_entities.media);
+      if (x.legacy?.entities?.media) walk(x.legacy.entities.media);
+      if (x.extended_entities?.media) walk(x.extended_entities.media);
+      if (x.entities?.media) walk(x.entities.media);
+
+      // общая рекурсия
+      for (const v of Object.values(x)) walk(v);
+    }
+  };
+
+  walk(tweetObj);
+  return Array.from(urls);
+}
+
+
+
 async function upsertCommunityTweet(communityId, tw) {
-  await q(
-    `
-    INSERT INTO community_tweets
-      (community_id, tweet_id, created_at, author_user_id, author_username, url, text)
-    VALUES
-      ($1,$2,$3,$4,$5,$6,$7)
-    ON CONFLICT (community_id, tweet_id) DO UPDATE SET
-      created_at=COALESCE(EXCLUDED.created_at, community_tweets.created_at),
-      author_user_id=COALESCE(EXCLUDED.author_user_id, community_tweets.author_user_id),
-      author_username=COALESCE(EXCLUDED.author_username, community_tweets.author_username),
-      url=COALESCE(EXCLUDED.url, community_tweets.url),
-      text=COALESCE(EXCLUDED.text, community_tweets.text)
-  `,
-    [
-      communityId,
-      tw.tweet_id,
-      tw.created_at,
-      tw.author_user_id,
-      tw.author_username,
-      tw.url,
-      tw.text,
-    ]
-  );
+  try {
+    // ✅ новая версия — пишет raw_json + media_urls
+    await q(
+      `
+      INSERT INTO community_tweets
+        (community_id, tweet_id, created_at, author_user_id, author_username, author_name, url, text, raw_json, media_urls)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)
+      ON CONFLICT (community_id, tweet_id) DO UPDATE SET
+        created_at=COALESCE(EXCLUDED.created_at, community_tweets.created_at),
+        author_user_id=COALESCE(EXCLUDED.author_user_id, community_tweets.author_user_id),
+        author_username=COALESCE(EXCLUDED.author_username, community_tweets.author_username),
+        author_name=COALESCE(EXCLUDED.author_name, community_tweets.author_name),
+        url=COALESCE(EXCLUDED.url, community_tweets.url),
+        text=COALESCE(EXCLUDED.text, community_tweets.text),
+        raw_json=COALESCE(EXCLUDED.raw_json, community_tweets.raw_json),
+        media_urls=COALESCE(EXCLUDED.media_urls, community_tweets.media_urls)
+    `,
+      [
+        communityId,
+        tw.tweet_id,
+        tw.created_at,
+        tw.author_user_id,
+        tw.author_username,
+        tw.author_name,
+        tw.url,
+        tw.text,
+        JSON.stringify(tw.raw_json || {}),
+        JSON.stringify(tw.media_urls || []),
+      ]
+    );
+  } catch (e) {
+    // если ты ещё не применил ALTER TABLE — не валим процесс, пишем по старой схеме
+    if (String(e?.code) === "42703") {
+      await q(
+        `
+        INSERT INTO community_tweets
+          (community_id, tweet_id, created_at, author_user_id, author_username, url, text)
+        VALUES
+          ($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (community_id, tweet_id) DO UPDATE SET
+          created_at=COALESCE(EXCLUDED.created_at, community_tweets.created_at),
+          author_user_id=COALESCE(EXCLUDED.author_user_id, community_tweets.author_user_id),
+          author_username=COALESCE(EXCLUDED.author_username, community_tweets.author_username),
+          url=COALESCE(EXCLUDED.url, community_tweets.url),
+          text=COALESCE(EXCLUDED.text, community_tweets.text)
+      `,
+        [communityId, tw.tweet_id, tw.created_at, tw.author_user_id, tw.author_username, tw.url, tw.text]
+      );
+      return;
+    }
+    throw e;
+  }
 }
 
 async function upsertMetrics(m) {
@@ -667,3 +755,4 @@ process.on("unhandledRejection", (e) => {
 });
 
 main();
+
